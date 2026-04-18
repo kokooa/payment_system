@@ -1,0 +1,214 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #faf7f2;
+  --ink: #2b2118;
+  --muted: #8b7e71;
+  --accent: #6F4E37;
+  --card-bg: #ffffff;
+  --shadow: 0 4px 16px rgba(61, 41, 25, 0.08);
+  --shadow-hover: 0 8px 28px rgba(61, 41, 25, 0.14);
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Pretendard', 'Apple SD Gothic Neo', sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+header {
+  text-align: center;
+  padding: 60px 20px 40px;
+}
+
+header h1 {
+  font-size: 2.5rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.subtitle {
+  color: var(--muted);
+  margin-top: 8px;
+  font-size: 1rem;
+}
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 20px 60px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 24px;
+}
+
+.loading {
+  grid-column: 1 / -1;
+  text-align: center;
+  padding: 60px;
+  color: var(--muted);
+}
+
+.card {
+  background: var(--card-bg);
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: var(--shadow);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  display: flex;
+  flex-direction: column;
+}
+
+.card:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-hover);
+}
+
+.card-image {
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  background: #f1ece5;
+}
+
+.card-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform 0.4s ease;
+  display: block;
+}
+
+.card:hover .card-image img {
+  transform: scale(1.06);
+}
+
+.card-image .no-image {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 0.9rem;
+  background: repeating-linear-gradient(45deg, #f1ece5, #f1ece5 10px, #e8e1d7 10px, #e8e1d7 20px);
+}
+
+.card-body {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: 8px;
+}
+
+.card h3 {
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.desc {
+  color: var(--muted);
+  font-size: 0.9rem;
+  flex: 1;
+  margin-bottom: 8px;
+}
+
+.price-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.price {
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.buy-btn {
+  background: var(--ink);
+  color: white;
+  border: none;
+  padding: 10px 18px;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s ease, transform 0.1s ease;
+}
+
+.buy-btn:hover:not(:disabled) {
+  background: var(--accent);
+}
+
+.buy-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.buy-btn:disabled {
+  background: var(--muted);
+  cursor: not-allowed;
+}
+
+footer {
+  text-align: center;
+  padding: 30px 20px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  border-top: 1px solid rgba(139, 126, 113, 0.2);
+}
+
+/* 결제 결과 페이지 (success/fail) 공용 */
+.result-page {
+  max-width: 480px;
+  margin: 80px auto;
+  padding: 40px 32px;
+  background: var(--card-bg);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+
+.result-page .icon {
+  font-size: 4rem;
+  margin-bottom: 16px;
+}
+
+.result-page h1 {
+  font-size: 1.75rem;
+  margin-bottom: 20px;
+}
+
+.result-page .detail {
+  background: var(--bg);
+  padding: 16px;
+  border-radius: 10px;
+  margin: 20px 0;
+  text-align: left;
+  font-size: 0.95rem;
+  line-height: 1.8;
+}
+
+.result-page .detail strong {
+  color: var(--muted);
+  margin-right: 8px;
+}
+
+.result-page a.back {
+  display: inline-block;
+  margin-top: 20px;
+  padding: 12px 24px;
+  background: var(--ink);
+  color: white;
+  text-decoration: none;
+  border-radius: 10px;
+  font-weight: 500;
+  transition: background 0.2s ease;
+}
+
+.result-page a.back:hover { background: var(--accent); }

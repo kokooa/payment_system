@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>☕ Coffee Store</title>
+  <script src="https://js.tosspayments.com/v1/payment"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <h1>☕ Coffee Store</h1>
+    <p class="subtitle">오늘 한 잔, 결제 한 번</p>
+  </header>
+
+  <main>
+    <div id="grid" class="grid">
+      <div class="loading">메뉴 불러오는 중...</div>
+    </div>
+  </main>
+
+  <footer>
+    <p>Powered by Toss Payments (테스트 모드)</p>
+  </footer>
+
+  <script>
+    const grid = document.getElementById('grid');
+
+    async function loadProducts() {
+      const products = await (await fetch('/api/products')).json();
+      grid.innerHTML = products.map(p => `
+        <article class="card">
+          <div class="card-image">
+            <img src="${p.image}" alt="${p.name}" loading="lazy"
+                 onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'no-image',textContent:'이미지 준비 중'}))">
+          </div>
+          <div class="card-body">
+            <h3>${p.name}</h3>
+            <p class="desc">${p.description}</p>
+            <div class="price-row">
+              <span class="price">${p.price.toLocaleString()}원</span>
+              <button class="buy-btn" data-id="${p.id}">주문하기</button>
+            </div>
+          </div>
+        </article>
+      `).join('');
+
+      document.querySelectorAll('.buy-btn').forEach(btn => {
+        btn.addEventListener('click', () => pay(btn.dataset.id, btn));
+      });
+    }
+
+    async function pay(productId, btn) {
+      btn.disabled = true;
+      btn.textContent = '처리 중...';
+
+      try {
+        // ① 클라이언트 키 받기
+        const { tossClientKey } = await (await fetch('/api/config')).json();
+        const tossPayments = TossPayments(tossClientKey);
+
+        // ② 서버에 주문 생성 요청
+        const res = await fetch('/api/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ productId })
+        });
+        const order = await res.json();
+
+        // ③ Toss 결제창
+        await tossPayments.requestPayment('카드', {
+          amount: order.amount,
+          orderId: order.order_id,
+          orderName: order.product_name,
+          successUrl: window.location.origin + '/api/payments/success',
+          failUrl:    window.location.origin + '/api/payments/fail',
+        });
+      } catch (err) {
+        alert('결제를 시작할 수 없습니다: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = '주문하기';
+      }
+    }
+
+    loadProducts();
+  </script>
+</body>
+</html>
