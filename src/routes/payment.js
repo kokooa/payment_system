@@ -158,6 +158,88 @@ router.get('/payments/success', async (req, res) => {
   }));
 });
 
+// Toss webhook 수신 (리다이렉트가 유실될 때의 안전망)
+// - 사용자가 결제 직후 창을 닫거나, 우리 DB UPDATE가 실패해 Toss는 DONE인데 우리는 PENDING인 경우 최종 상태를 맞춘다
+// - body는 신뢰하지 않는다. paymentKey로 Toss에 역조회해 "진짜 상태"를 확인
+// - 멱등: PENDING일 때만 전이하므로 같은 webhook이 여러 번 와도 안전
+// - 항상 200 반환. non-2xx면 Toss가 무한 재시도하므로 에러는 로그로만 남긴다
+router.post('/webhooks/toss', async (req, res) => {
+  const { data } = req.body || {};
+  const paymentKey = data && data.paymentKey;
+  const orderId = data && data.orderId;
+
+  if (!paymentKey || !orderId) {
+    console.warn('[webhook] missing paymentKey or orderId', req.body);
+    return res.status(200).json({ ok: true });
+  }
+
+  try {
+    // 1) 우리가 아는 주문
+    const { rows } = await db.query(
+      `SELECT order_id, amount, status FROM orders WHERE order_id = $1`,
+      [orderId]
+    );
+    const order = rows[0];
+    if (!order) {
+      console.warn('[webhook] unknown orderId', orderId);
+      return res.status(200).json({ ok: true });
+    }
+
+    // 2) Toss에 실제 상태 역조회 (body를 믿지 않는 핵심 단계)
+    const secretKey = process.env.TOSS_SECRET_KEY;
+    const basicAuth = Buffer.from(secretKey + ':').toString('base64');
+    const tossRes = await fetch(
+      `https://api.tosspayments.com/v1/payments/${paymentKey}`,
+      { headers: { 'Authorization': `Basic ${basicAuth}` } }
+    );
+    const toss = await tossRes.json();
+
+    if (!tossRes.ok) {
+      console.error('[webhook] toss lookup failed', toss);
+      return res.status(200).json({ ok: true });
+    }
+
+    // 3) 금액 검증 (Toss 응답과 DB 비교)
+    if (toss.totalAmount !== order.amount) {
+      console.error('[webhook] amount mismatch', {
+        orderId, toss: toss.totalAmount, db: order.amount,
+      });
+      return res.status(200).json({ ok: true });
+    }
+
+    // 4) Toss 상태 → 내부 상태 매핑 (중간 상태는 전이 안 함)
+    const mapping = {
+      DONE: 'PAID',
+      CANCELED: 'CANCELLED',
+      ABORTED: 'FAILED',
+      EXPIRED: 'EXPIRED',
+    };
+    const nextStatus = mapping[toss.status];
+    if (!nextStatus) {
+      return res.status(200).json({ ok: true });
+    }
+
+    // 5) 조건부 UPDATE: PENDING일 때만 전이 (리다이렉트 핸들러가 이미 처리했으면 no-op)
+    const result = await db.query(
+      `UPDATE orders
+       SET status = $2,
+           payment_key = COALESCE(payment_key, $3),
+           updated_at = NOW()
+       WHERE order_id = $1 AND status = 'PENDING'
+       RETURNING order_id`,
+      [orderId, nextStatus, paymentKey]
+    );
+
+    if (result.rowCount > 0) {
+      console.log('[webhook] transitioned', { orderId, to: nextStatus });
+    }
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('[webhook] error', err);
+    res.status(200).json({ ok: true });
+  }
+});
+
 // 결제 실패 (Toss가 실패 시 여기로 리다이렉트)
 router.get('/payments/fail', async (req, res) => {
   const { code, message, orderId } = req.query;
