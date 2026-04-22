@@ -416,4 +416,42 @@ router.post('/orders/:orderId/refund', async (req, res) => {
   });
 });
 
+// 관리자 전용 단순 Bearer 토큰 가드
+// ADMIN_TOKEN 미설정 시 전면 거부 (환경변수 누락을 보안 문제로 차단)
+function requireAdmin(req, res, next) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!process.env.ADMIN_TOKEN || token !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+}
+
+// 만료 배치: 30분 이상 PENDING으로 남은 주문을 EXPIRED로 전이
+// - 시간 기준만 사용 (Toss 역조회 없음, MVP 단순화)
+// - UPDATE ... RETURNING 으로 전이된 order_id 목록을 받아 각각 이력 기록
+// - 전체를 트랜잭션으로 묶어 UPDATE 성공 + 이력 누락 같은 drift 방지
+// - 멱등: 반복 호출해도 이미 PENDING 아닌 주문은 조건에 안 걸림
+router.post('/admin/expire-pending', requireAdmin, async (req, res) => {
+  const expired = await db.withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `UPDATE orders
+       SET status = 'EXPIRED', updated_at = NOW()
+       WHERE status = 'PENDING'
+         AND created_at < NOW() - INTERVAL '30 minutes'
+       RETURNING order_id`
+    );
+    for (const { order_id } of rows) {
+      await client.query(
+        `INSERT INTO order_events (order_id, event_type, from_status, to_status, reason)
+         VALUES ($1, 'EXPIRED_BY_BATCH', 'PENDING', 'EXPIRED', $2)`,
+        [order_id, 'created_at older than 30 minutes']
+      );
+    }
+    return rows.map(r => r.order_id);
+  });
+
+  res.json({ ok: true, expiredCount: expired.length, orderIds: expired });
+});
+
 module.exports = router;
