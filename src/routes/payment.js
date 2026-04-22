@@ -317,4 +317,103 @@ router.get('/payments/fail', async (req, res) => {
   }));
 });
 
+// 환불 (PAID → REFUNDED, 전액 환불만 지원)
+// - Toss cancel API 호출 → 성공 시에만 DB 상태 전이 (Toss가 진실의 원천)
+// - 상태 전이 + 성공 이력은 트랜잭션으로 묶어 drift 방지
+// - 요청/실패는 별도 이력(append-only)로 기록해 감사 로그로 사용
+router.post('/orders/:orderId/refund', async (req, res) => {
+  const { orderId } = req.params;
+  const { reason } = req.body || {};
+
+  if (!reason || !String(reason).trim()) {
+    return res.status(400).json({ error: '환불 사유(reason)가 필요합니다' });
+  }
+
+  // 1. 주문 조회
+  const { rows } = await db.query(
+    `SELECT order_id, product_name, amount, status, payment_key FROM orders WHERE order_id = $1`,
+    [orderId]
+  );
+  const order = rows[0];
+  if (!order) {
+    return res.status(404).json({ error: '주문을 찾을 수 없습니다' });
+  }
+
+  // 2. 상태 검증 (PAID만 환불 가능)
+  if (order.status === 'REFUNDED') {
+    return res.status(409).json({ error: '이미 환불된 주문입니다' });
+  }
+  if (order.status !== 'PAID') {
+    return res.status(400).json({ error: `환불 불가 상태입니다 (${order.status})` });
+  }
+  if (!order.payment_key) {
+    return res.status(400).json({ error: 'paymentKey가 없어 환불할 수 없습니다' });
+  }
+
+  // 3. 환불 요청 기록 (Toss 호출 전 흔적 — 중간 실패 추적용)
+  await db.query(
+    `INSERT INTO order_events (order_id, event_type, reason, payload)
+     VALUES ($1, 'REFUND_REQUESTED', $2, $3)`,
+    [orderId, reason, JSON.stringify({ amount: order.amount })]
+  );
+
+  // 4. Toss cancel API 호출
+  const secretKey = process.env.TOSS_SECRET_KEY;
+  const basicAuth = Buffer.from(secretKey + ':').toString('base64');
+
+  const tossRes = await fetch(
+    `https://api.tosspayments.com/v1/payments/${order.payment_key}/cancel`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${basicAuth}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ cancelReason: reason }),
+    }
+  );
+
+  const tossData = await tossRes.json();
+
+  if (!tossRes.ok) {
+    // Toss 거절 — 상태 전이 없음. 실패 이력만 기록.
+    await db.query(
+      `INSERT INTO order_events (order_id, event_type, reason, payload)
+       VALUES ($1, 'REFUND_FAILED', $2, $3)`,
+      [orderId, tossData.message || null, JSON.stringify(tossData)]
+    );
+    return res.status(400).json({ error: '환불 실패', message: tossData.message });
+  }
+
+  // 5. PAID → REFUNDED 전이 + 성공 이력 (트랜잭션)
+  const transitioned = await db.withTransaction(async (client) => {
+    const updateResult = await client.query(
+      `UPDATE orders SET status = 'REFUNDED', updated_at = NOW()
+       WHERE order_id = $1 AND status = 'PAID'
+       RETURNING order_id`,
+      [orderId]
+    );
+    if (updateResult.rowCount === 0) return false;
+    await client.query(
+      `INSERT INTO order_events (order_id, event_type, from_status, to_status, reason, payload)
+       VALUES ($1, 'REFUND_SUCCEEDED', 'PAID', 'REFUNDED', $2, $3)`,
+      [orderId, reason, JSON.stringify(tossData)]
+    );
+    return true;
+  });
+
+  if (!transitioned) {
+    // 경쟁 조건: Toss는 환불됐는데 DB가 이미 다른 상태 (드물지만 로그로 남김)
+    console.error('[refund] toss cancelled but db already transitioned', { orderId });
+    return res.status(409).json({ error: '주문 상태가 이미 변경되어 있습니다' });
+  }
+
+  res.json({
+    ok: true,
+    orderId,
+    status: 'REFUNDED',
+    refundedAmount: order.amount,
+  });
+});
+
 module.exports = router;
