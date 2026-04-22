@@ -59,15 +59,23 @@ router.post('/orders', async (req, res) => {
   // 2. orderId 발급 (서버가 만든다)
   const orderId = `ord_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
 
-  // 3. DB 저장 (금액도 서버가 정한 값)
-  const result = await db.query(
-    `INSERT INTO orders (order_id, product_name, amount, status)
-     VALUES ($1, $2, $3, 'PENDING')
-     RETURNING order_id, product_name, amount, status`,
-    [orderId, product.name, product.price]
-  );
+  // 3. 주문 INSERT + 이력 기록을 한 트랜잭션으로 (둘 중 하나만 성공하면 drift 발생)
+  const order = await db.withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `INSERT INTO orders (order_id, product_name, amount, status)
+       VALUES ($1, $2, $3, 'PENDING')
+       RETURNING order_id, product_name, amount, status`,
+      [orderId, product.name, product.price]
+    );
+    await client.query(
+      `INSERT INTO order_events (order_id, event_type, to_status, payload)
+       VALUES ($1, 'ORDER_CREATED', 'PENDING', $2)`,
+      [orderId, JSON.stringify({ productId, productName: product.name, amount: product.price })]
+    );
+    return rows[0];
+  });
 
-  res.status(201).json(result.rows[0]);
+  res.status(201).json(order);
 });
 
 // 결제 승인 (Toss가 브라우저를 여기로 리다이렉트시킴)
@@ -87,6 +95,12 @@ router.get('/payments/success', async (req, res) => {
 
   // 2. 금액 위변조 검증 (URL의 amount vs DB의 amount)
   if (Number(amount) !== order.amount) {
+    // 상태는 바꾸지 않지만 위변조 의심은 반드시 기록 (보안 로그의 핵심)
+    await db.query(
+      `INSERT INTO order_events (order_id, event_type, reason, payload)
+       VALUES ($1, 'AMOUNT_MISMATCH', 'URL amount != DB amount', $2)`,
+      [orderId, JSON.stringify({ urlAmount: Number(amount), dbAmount: order.amount })]
+    );
     return res.status(400).send('금액이 일치하지 않습니다 (위변조 의심)');
   }
 
@@ -111,12 +125,22 @@ router.get('/payments/success', async (req, res) => {
   const tossData = await tossRes.json();
 
   if (!tossRes.ok) {
-    // Toss가 거절 → FAILED로 전이 (PENDING → FAILED만 허용)
-    await db.query(
-      `UPDATE orders SET status = 'FAILED', updated_at = NOW()
-       WHERE order_id = $1 AND status = 'PENDING'`,
-      [orderId]
-    );
+    // Toss 거절 → PENDING→FAILED 전이 + 이력 기록을 트랜잭션으로 묶음
+    await db.withTransaction(async (client) => {
+      const updateResult = await client.query(
+        `UPDATE orders SET status = 'FAILED', updated_at = NOW()
+         WHERE order_id = $1 AND status = 'PENDING'
+         RETURNING order_id`,
+        [orderId]
+      );
+      if (updateResult.rowCount > 0) {
+        await client.query(
+          `INSERT INTO order_events (order_id, event_type, from_status, to_status, reason, payload)
+           VALUES ($1, 'CONFIRM_REJECTED', 'PENDING', 'FAILED', $2, $3)`,
+          [orderId, tossData.message || null, JSON.stringify(tossData)]
+        );
+      }
+    });
     return res.status(400).send(renderResult({
       success: false,
       title: '결제에 실패했어요',
@@ -126,6 +150,12 @@ router.get('/payments/success', async (req, res) => {
 
   // 5. Toss 응답의 금액도 다시 검증
   if (tossData.totalAmount !== order.amount) {
+    // 상태 전이 없음. 위변조 의심 로그만 기록.
+    await db.query(
+      `INSERT INTO order_events (order_id, event_type, reason, payload)
+       VALUES ($1, 'AMOUNT_MISMATCH', 'Toss response amount != DB amount', $2)`,
+      [orderId, JSON.stringify({ tossAmount: tossData.totalAmount, dbAmount: order.amount })]
+    );
     return res.status(400).send(renderResult({
       success: false,
       title: '금액 검증 실패',
@@ -133,17 +163,26 @@ router.get('/payments/success', async (req, res) => {
     }));
   }
 
-  // 6. 상태 전이: PENDING → PAID (조건부 UPDATE)
-  const updateResult = await db.query(
-    `UPDATE orders
-     SET status = 'PAID', payment_key = $2, updated_at = NOW()
-     WHERE order_id = $1 AND status = 'PENDING'
-     RETURNING order_id`,
-    [orderId, paymentKey]
-  );
+  // 6. 상태 전이: PENDING → PAID + 이력 기록 (트랜잭션)
+  const transitioned = await db.withTransaction(async (client) => {
+    const updateResult = await client.query(
+      `UPDATE orders
+       SET status = 'PAID', payment_key = $2, updated_at = NOW()
+       WHERE order_id = $1 AND status = 'PENDING'
+       RETURNING order_id`,
+      [orderId, paymentKey]
+    );
+    if (updateResult.rowCount === 0) return false;
+    await client.query(
+      `INSERT INTO order_events (order_id, event_type, from_status, to_status, payload)
+       VALUES ($1, 'CONFIRM_APPROVED', 'PENDING', 'PAID', $2)`,
+      [orderId, JSON.stringify(tossData)]
+    );
+    return true;
+  });
 
-  if (updateResult.rowCount === 0) {
-    // 동시에 다른 요청이 이미 처리한 경우
+  if (!transitioned) {
+    // 동시에 다른 요청(webhook 등)이 이미 처리한 경우
     return res.status(409).send('이미 처리된 주문입니다');
   }
 
@@ -219,18 +258,27 @@ router.post('/webhooks/toss', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    // 5) 조건부 UPDATE: PENDING일 때만 전이 (리다이렉트 핸들러가 이미 처리했으면 no-op)
-    const result = await db.query(
-      `UPDATE orders
-       SET status = $2,
-           payment_key = COALESCE(payment_key, $3),
-           updated_at = NOW()
-       WHERE order_id = $1 AND status = 'PENDING'
-       RETURNING order_id`,
-      [orderId, nextStatus, paymentKey]
-    );
+    // 5) 조건부 UPDATE + 이력 기록 (트랜잭션). PENDING일 때만 전이 & 기록.
+    const didTransition = await db.withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE orders
+         SET status = $2,
+             payment_key = COALESCE(payment_key, $3),
+             updated_at = NOW()
+         WHERE order_id = $1 AND status = 'PENDING'
+         RETURNING order_id`,
+        [orderId, nextStatus, paymentKey]
+      );
+      if (result.rowCount === 0) return false;
+      await client.query(
+        `INSERT INTO order_events (order_id, event_type, from_status, to_status, reason, payload)
+         VALUES ($1, 'WEBHOOK_RECONCILED', 'PENDING', $2, $3, $4)`,
+        [orderId, nextStatus, `Toss status: ${toss.status}`, JSON.stringify(toss)]
+      );
+      return true;
+    });
 
-    if (result.rowCount > 0) {
+    if (didTransition) {
       console.log('[webhook] transitioned', { orderId, to: nextStatus });
     }
     res.status(200).json({ ok: true });
@@ -245,11 +293,21 @@ router.get('/payments/fail', async (req, res) => {
   const { code, message, orderId } = req.query;
 
   if (orderId) {
-    await db.query(
-      `UPDATE orders SET status = 'FAILED', updated_at = NOW()
-       WHERE order_id = $1 AND status = 'PENDING'`,
-      [orderId]
-    );
+    await db.withTransaction(async (client) => {
+      const updateResult = await client.query(
+        `UPDATE orders SET status = 'FAILED', updated_at = NOW()
+         WHERE order_id = $1 AND status = 'PENDING'
+         RETURNING order_id`,
+        [orderId]
+      );
+      if (updateResult.rowCount > 0) {
+        await client.query(
+          `INSERT INTO order_events (order_id, event_type, from_status, to_status, reason, payload)
+           VALUES ($1, 'FAIL_REDIRECT', 'PENDING', 'FAILED', $2, $3)`,
+          [orderId, message || null, JSON.stringify({ code, message })]
+        );
+      }
+    });
   }
 
   res.status(400).send(renderResult({
