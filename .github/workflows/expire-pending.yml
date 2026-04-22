@@ -1,0 +1,22 @@
+name: Expire pending orders
+
+# 30분마다 관리자 엔드포인트를 호출해 PENDING 좀비를 정리한다.
+# 스케줄러는 여기서 돌고, 만료 로직 자체는 앱 쪽에 있음.
+on:
+  schedule:
+    # 매 30분 (UTC 기준) — GitHub Actions 스케줄은 ±몇 분 지연 가능
+    - cron: '*/30 * * * *'
+  # 수동 실행 버튼 (Actions 탭에서 버튼으로 즉시 트리거)
+  workflow_dispatch:
+
+jobs:
+  expire:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call expire-pending endpoint
+        # -f: HTTP 4xx/5xx 시 non-zero 종료 → workflow 실패 → GitHub이 메일 알림
+        # -sS: 진행바 숨기되 에러는 출력
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${{ secrets.ADMIN_TOKEN }}" \
+            "${{ secrets.RENDER_BASE_URL }}/api/admin/expire-pending"
