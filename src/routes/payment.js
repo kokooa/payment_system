@@ -454,4 +454,106 @@ router.post('/admin/expire-pending', requireAdmin, async (req, res) => {
   res.json({ ok: true, expiredCount: expired.length, orderIds: expired });
 });
 
+// 보상 배치: 10분 이상 PENDING으로 남은 주문을 Toss에 역조회해 실제 상태로 보정
+// - webhook과 success 리다이렉트가 둘 다 유실된 엣지 케이스 복구 (돈은 빠졌는데 우리는 PENDING)
+// - Toss orderId 기반 조회로 paymentKey 소실도 극복
+// - 각 주문을 순회하며 Toss 응답에 따라 분기
+// - 주의: expire 배치와 경쟁 가능 (expire 30분 > reconcile 10분이라 reconcile이 먼저 선점할 확률↑)
+//   드물게 Toss가 29분에 capture + expire가 30분에 먼저 도는 케이스 존재. 학습 범위에선 수용.
+router.post('/admin/reconcile-pending', requireAdmin, async (req, res) => {
+  const { rows: candidates } = await db.query(
+    `SELECT order_id, amount FROM orders
+     WHERE status = 'PENDING'
+       AND created_at < NOW() - INTERVAL '10 minutes'`
+  );
+
+  const secretKey = process.env.TOSS_SECRET_KEY;
+  const basicAuth = Buffer.from(secretKey + ':').toString('base64');
+
+  const results = {
+    scanned: candidates.length,
+    reconciled: [],
+    untouched: [],
+    errors: [],
+  };
+
+  // Toss 상태 → 내부 상태 매핑 (webhook과 동일 정책 유지)
+  const mapping = {
+    DONE: 'PAID',
+    CANCELED: 'CANCELLED',
+    ABORTED: 'FAILED',
+    EXPIRED: 'EXPIRED',
+  };
+
+  for (const { order_id, amount } of candidates) {
+    try {
+      const tossRes = await fetch(
+        `https://api.tosspayments.com/v1/payments/orders/${order_id}`,
+        { headers: { 'Authorization': `Basic ${basicAuth}` } }
+      );
+
+      // 결제 시도 자체가 없는 주문 — expire 배치에 맡김
+      if (tossRes.status === 404) {
+        results.untouched.push({ orderId: order_id, reason: 'no payment attempted' });
+        continue;
+      }
+
+      const tossData = await tossRes.json();
+
+      if (!tossRes.ok) {
+        console.error('[reconcile] toss lookup failed', { orderId: order_id, tossData });
+        results.errors.push({ orderId: order_id, reason: 'toss lookup failed' });
+        continue;
+      }
+
+      // 금액 불일치 — 상태 전이 없이 의심 로그만
+      if (tossData.totalAmount !== amount) {
+        await db.query(
+          `INSERT INTO order_events (order_id, event_type, reason, payload)
+           VALUES ($1, 'AMOUNT_MISMATCH', 'Reconcile: Toss amount != DB amount', $2)`,
+          [order_id, JSON.stringify({ tossAmount: tossData.totalAmount, dbAmount: amount })]
+        );
+        results.errors.push({ orderId: order_id, reason: 'amount mismatch' });
+        continue;
+      }
+
+      // 중간 상태(READY/IN_PROGRESS 등)는 건드리지 않음
+      const nextStatus = mapping[tossData.status];
+      if (!nextStatus) {
+        results.untouched.push({ orderId: order_id, reason: `toss status: ${tossData.status}` });
+        continue;
+      }
+
+      // 조건부 UPDATE + 이력 기록 (트랜잭션)
+      const transitioned = await db.withTransaction(async (client) => {
+        const result = await client.query(
+          `UPDATE orders
+           SET status = $2,
+               payment_key = COALESCE(payment_key, $3),
+               updated_at = NOW()
+           WHERE order_id = $1 AND status = 'PENDING'
+           RETURNING order_id`,
+          [order_id, nextStatus, tossData.paymentKey || null]
+        );
+        if (result.rowCount === 0) return false;
+        await client.query(
+          `INSERT INTO order_events (order_id, event_type, from_status, to_status, reason, payload)
+           VALUES ($1, 'RECONCILED_BY_BATCH', 'PENDING', $2, $3, $4)`,
+          [order_id, nextStatus, `Toss status: ${tossData.status}`, JSON.stringify(tossData)]
+        );
+        return true;
+      });
+
+      if (transitioned) {
+        results.reconciled.push({ orderId: order_id, to: nextStatus });
+      }
+    } catch (err) {
+      console.error('[reconcile] error', { orderId: order_id, err: err.message });
+      results.errors.push({ orderId: order_id, error: err.message });
+    }
+  }
+
+  res.json({ ok: true, ...results });
+});
+
 module.exports = router;

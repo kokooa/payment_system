@@ -140,9 +140,8 @@ payment_system/
 - [x] 전액 환불 (`PAID → REFUNDED` 전이, Toss cancel 연동)
 - [x] 상태 전이 감사 로그 (`order_events`)
 - [x] PENDING 주문 만료 처리 (관리자 엔드포인트로 수동 트리거)
-- [ ] Webhook HMAC 서명 검증
-- [ ] 만료 배치 스케줄링 (외부 cron으로 주기 호출)
-- [ ] 부분 환불 지원
+- [x] 만료 배치 스케줄링 (GitHub Actions cron으로 30분마다 호출)
+- [ ] Webhook HMAC 서명 검증 (실 프로덕션 전환 시 진행 예정, 학습 범위에선 보류)
 - [ ] Toss 승인 성공 + 내부 DB 실패 케이스 복구 로직
 
 ## 학습한 개념

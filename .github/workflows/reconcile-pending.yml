@@ -1,0 +1,20 @@
+name: Reconcile pending orders
+
+# 10분마다 Toss에 역조회해 PENDING 주문의 실제 상태를 보정한다.
+# webhook과 success 리다이렉트가 둘 다 유실된 엣지 케이스의 safety net.
+on:
+  schedule:
+    # 매 10분 (UTC 기준) — GitHub Actions 스케줄은 ±몇 분 지연 가능
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call reconcile-pending endpoint
+        # -f: HTTP 4xx/5xx 시 non-zero 종료 → workflow 실패 → GitHub이 메일 알림
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${{ secrets.ADMIN_TOKEN }}" \
+            "${{ secrets.RENDER_BASE_URL }}/api/admin/reconcile-pending"
