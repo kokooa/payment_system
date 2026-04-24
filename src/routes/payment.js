@@ -15,6 +15,19 @@ const PRODUCTS = {
   'prod_006': { name: '초코라떼',   price: 5500, image: '/images/prod_006.jpg', description: '달콤한 초콜릿' },
 };
 
+// Toss API 호출 타임아웃 (ms) — 외부 hang이 DB 커넥션을 무한히 붙잡는 것 방지
+const TOSS_FETCH_TIMEOUT_MS = 5000;
+
+// HTML 이스케이프 — renderResult에서 Toss 메시지 등 외부 입력이 템플릿에 주입되는 것 방어
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // 상품 목록 조회
 router.get('/products', (req, res) => {
   const list = Object.entries(PRODUCTS).map(([id, p]) => ({ id, ...p }));
@@ -24,21 +37,22 @@ router.get('/products', (req, res) => {
 // 결제 결과 페이지 렌더러 (서버사이드 HTML)
 function renderResult({ success, title, details }) {
   const icon = success ? '✅' : '❌';
+  const safeTitle = escapeHtml(title);
   const detailHtml = Object.entries(details)
-    .map(([k, v]) => `<div><strong>${k}</strong>${v}</div>`)
+    .map(([k, v]) => `<div><strong>${escapeHtml(k)}</strong>${escapeHtml(v)}</div>`)
     .join('');
   return `<!DOCTYPE html>
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title}</title>
+  <title>${safeTitle}</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <div class="result-page">
     <div class="icon">${icon}</div>
-    <h1>${title}</h1>
+    <h1>${safeTitle}</h1>
     <div class="detail">${detailHtml}</div>
     <a class="back" href="/">메뉴로 돌아가기</a>
   </div>
@@ -120,6 +134,7 @@ router.get('/payments/success', async (req, res) => {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ paymentKey, orderId, amount: Number(amount) }),
+    signal: AbortSignal.timeout(TOSS_FETCH_TIMEOUT_MS),
   });
 
   const tossData = await tossRes.json();
@@ -229,7 +244,10 @@ router.post('/webhooks/toss', async (req, res) => {
     const basicAuth = Buffer.from(secretKey + ':').toString('base64');
     const tossRes = await fetch(
       `https://api.tosspayments.com/v1/payments/${paymentKey}`,
-      { headers: { 'Authorization': `Basic ${basicAuth}` } }
+      {
+        headers: { 'Authorization': `Basic ${basicAuth}` },
+        signal: AbortSignal.timeout(TOSS_FETCH_TIMEOUT_MS),
+      }
     );
     const toss = await tossRes.json();
 
@@ -243,6 +261,11 @@ router.post('/webhooks/toss', async (req, res) => {
       console.error('[webhook] amount mismatch', {
         orderId, toss: toss.totalAmount, db: order.amount,
       });
+      await db.query(
+        `INSERT INTO order_events (order_id, event_type, reason, payload)
+         VALUES ($1, 'AMOUNT_MISMATCH', 'Webhook: Toss amount != DB amount', $2)`,
+        [orderId, JSON.stringify({ tossAmount: toss.totalAmount, dbAmount: order.amount })]
+      );
       return res.status(200).json({ ok: true });
     }
 
@@ -370,6 +393,7 @@ router.post('/orders/:orderId/refund', async (req, res) => {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ cancelReason: reason }),
+      signal: AbortSignal.timeout(TOSS_FETCH_TIMEOUT_MS),
     }
   );
 
@@ -489,7 +513,10 @@ router.post('/admin/reconcile-pending', requireAdmin, async (req, res) => {
     try {
       const tossRes = await fetch(
         `https://api.tosspayments.com/v1/payments/orders/${order_id}`,
-        { headers: { 'Authorization': `Basic ${basicAuth}` } }
+        {
+          headers: { 'Authorization': `Basic ${basicAuth}` },
+          signal: AbortSignal.timeout(TOSS_FETCH_TIMEOUT_MS),
+        }
       );
 
       // 결제 시도 자체가 없는 주문 — expire 배치에 맡김
