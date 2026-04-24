@@ -12,3 +12,6 @@ node_modules/
 # Logs
 *.log
 npm-debug.log*
+
+# 학습용 보고서 (배포 제외)
+STUDY_REPORT.md
